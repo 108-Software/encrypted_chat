@@ -11,7 +11,6 @@ import (
 	"io"
 	"log"
 	"math/big"
-	"os"
 	"sync"
 	"time"
 
@@ -19,7 +18,7 @@ import (
 )
 
 func main() {
-	hostName := flag.String("hostname", "192.168.249.48", "hostname/ip of the server")
+	hostName := flag.String("hostname", "192.168.0.100", "hostname/ip of the server")
 	portNum := flag.String("port", "4242", "port number of the server")
 
 	flag.Parse()
@@ -35,8 +34,9 @@ func main() {
 	defer listener.Close()
 
 	messageCh := make(chan []byte)
+	senderCh := make(chan quic.Stream)
 
-	go broadcastMessages(messageCh)
+	go broadcastMessages(messageCh, senderCh)
 
 	for {
 		sess, err := listener.Accept(context.Background())
@@ -45,13 +45,15 @@ func main() {
 			continue
 		}
 
-		go handleSession(sess, messageCh)
+		go handleSession(sess, messageCh, senderCh)
 	}
 }
 
-func handleSession(sess quic.Connection, messageCh chan<- []byte) {
+func handleSession(sess quic.Connection, messageCh chan<- []byte, senderCh chan<- quic.Stream) {
 	defer sess.CloseWithError(0, "")
 	defer log.Println("Session closed")
+
+	log.Println("Session opened")
 
 	stream, err := sess.AcceptStream(context.Background())
 	if err != nil {
@@ -62,12 +64,10 @@ func handleSession(sess quic.Connection, messageCh chan<- []byte) {
 
 	log.Println("Stream opened")
 
-	// Add the client to the list of clients
 	clientMu.Lock()
 	clients[stream] = struct{}{}
 	clientMu.Unlock()
 
-	// Read from the stream and send messages to all clients
 	for {
 		buf := make([]byte, 1024)
 		n, err := stream.Read(buf)
@@ -83,22 +83,23 @@ func handleSession(sess quic.Connection, messageCh chan<- []byte) {
 		message := buf[:n]
 		log.Printf("Received message: %s\n", message)
 
-		// Send the received message to all clients
 		messageCh <- message
-		os.Stdin.WriteString("")
+		senderCh <- stream
 	}
 }
 
-func broadcastMessages(messageCh <-chan []byte) {
+func broadcastMessages(messageCh <-chan []byte, senderCh <-chan quic.Stream) {
 	for {
 		select {
 		case message := <-messageCh:
+			sender := <-senderCh
 			clientMu.Lock()
 			for client := range clients {
-				if _, err := client.Write(message); err != nil {
-					log.Println("Error writing message to client:", err)
+				if client != sender {
+					if _, err := client.Write(message); err != nil {
+						log.Println("Error writing message to client:", err)
+					}
 				}
-
 			}
 			clientMu.Unlock()
 		}
@@ -110,7 +111,6 @@ var (
 	clientMu sync.Mutex
 )
 
-// Setup a bare-bones TLS config for the server
 func generateTLSConfig() *tls.Config {
 	key, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {

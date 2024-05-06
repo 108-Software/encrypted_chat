@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -15,11 +14,8 @@ import (
 )
 
 func main() {
-
-	hostName := flag.String("hostname", "192.168.133.48", "hostname/ip of the server")
+	hostName := flag.String("hostname", "192.168.0.100", "hostname/ip of the server")
 	portNum := flag.String("port", "4242", "port number of the server")
-	//numEcho := flag.Int("necho", 100, "number of echos")
-	timeoutDuration := flag.Int("rtt", 1000, "timeout duration (in ms)")
 
 	flag.Parse()
 
@@ -32,48 +28,47 @@ func main() {
 
 	session, err := quic.DialAddr(context.Background(), addr, tlsConf, nil)
 	if err != nil {
-		fmt.Println(session, "\n", addr, "\n", tlsConf, "\n")
+		log.Fatal(err)
 	}
 
 	stream, err := session.OpenStreamSync(context.Background())
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	timeout := time.Duration(*timeoutDuration) * time.Millisecond
-
-	resp := make(chan string)
-
+	reader := bufio.NewReader(os.Stdin)
 	for {
-		message, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		message, err := reader.ReadString('\n')
+		if err != nil {
+			log.Println("Error reading message:", err)
+			break
+		}
 
-		log.Printf("Client: Sending '%s'", message)
+		log.Printf("Client: Sending %s", message)
 		_, err = stream.Write([]byte(message))
 		if err != nil {
-			panic(err)
+			log.Println("Error sending message:", err)
+			break
 		}
 
 		log.Println("Done. Waiting for echo")
 
-		go func() {
-			buff := make([]byte, len(message))
-			_, err = io.ReadFull(stream, buff)
-			if err != nil {
-				panic(err)
+		// Ожидаем ответ от сервера
+		buff := make([]byte, 1024)
+		n, err := stream.Read(buff)
+		if err != nil {
+			if err == io.EOF {
+				log.Println("Server disconnected")
+				break
 			}
-
-			resp <- string(buff)
-		}()
-
-		select {
-		case reply := <-resp:
-			log.Printf("Client: Got '%s'", reply)
-		case <-time.After(timeout):
-			log.Printf("Client: Timed out\n")
+			log.Println("Error reading response:", err)
+			break
 		}
 
-		/*if counter == *numEcho {
-			break
-		}*/
+		reply := string(buff[:n])
+		log.Printf("Client: Got %s", reply)
+
+		// Пауза перед отправкой следующего сообщения
+		time.Sleep(100 * time.Millisecond)
 	}
 }

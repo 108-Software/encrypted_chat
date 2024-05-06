@@ -1,8 +1,6 @@
-module emample.com/m
+module example.com/m
 
-go 1.21
-
-toolchain go1.22.1
+go 1.20
 
 require github.com/quic-go/quic-go v0.42.0
 
