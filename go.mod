@@ -1,8 +1,13 @@
 module example.com/m
 
-go 1.20
+go 1.21
 
-require github.com/quic-go/quic-go v0.42.0
+toolchain go1.22.2
+
+require (
+	github.com/lib/pq v1.10.9
+	github.com/quic-go/quic-go v0.42.0
+)
 
 require (
 	github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 // indirect

@@ -6,19 +6,38 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
+	"example.com/m/database"
 	"github.com/quic-go/quic-go"
 )
 
+type AuthData struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type Client struct {
+	Username string
+	Stream   quic.Stream
+}
+
+var (
+	clients  = make(map[quic.Stream]*Client)
+	clientMu sync.Mutex
+)
+
 func main() {
-	hostName := flag.String("hostname", "192.168.0.100", "hostname/ip of the server")
+	hostName := flag.String("hostname", "192.168.0.100", "hostname/ip of the server") //указываем удресс и порт для сервера
 	portNum := flag.String("port", "4242", "port number of the server")
 
 	flag.Parse()
@@ -27,7 +46,7 @@ func main() {
 
 	log.Println("Server running @", addr)
 
-	listener, err := quic.ListenAddr(addr, generateTLSConfig(), nil)
+	listener, err := quic.ListenAddr(addr, generateTLSConfig(), &quic.Config{}) //запускаем и слушаем по адресу, сервер
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -36,7 +55,7 @@ func main() {
 	messageCh := make(chan []byte)
 	senderCh := make(chan quic.Stream)
 
-	go broadcastMessages(messageCh, senderCh)
+	go broadcastMessages(messageCh, senderCh) //обрабатываем входящии сообщения
 
 	for {
 		sess, err := listener.Accept(context.Background())
@@ -49,7 +68,7 @@ func main() {
 	}
 }
 
-func handleSession(sess quic.Connection, messageCh chan<- []byte, senderCh chan<- quic.Stream) {
+func handleSession(sess quic.Connection, messageCh chan<- []byte, senderCh chan<- quic.Stream) { //организовываем отдельную сессию для каждого клиента
 	defer sess.CloseWithError(0, "")
 	defer log.Println("Session closed")
 
@@ -64,16 +83,48 @@ func handleSession(sess quic.Connection, messageCh chan<- []byte, senderCh chan<
 
 	log.Println("Stream opened")
 
+	// Authentication
+	buf := make([]byte, 1024) //принимаем данные для аутентификации пользователей
+	n, err := stream.Read(buf)
+	if err != nil {
+		log.Println("Error reading authentication data:", err)
+		return
+	}
+
+	var authData AuthData
+	err = json.Unmarshal(buf[:n], &authData)
+	if err != nil {
+		log.Println("Error unmarshalling authentication data:", err)
+		return
+	}
+
+	loginData := map[string]interface{}{
+		"username": authData.Username,
+		"password": authData.Password,
+	}
+
+	if !database.Search_account_map(loginData) { //ищем учётную запись в бд
+		log.Println("Authentication failed for user:", authData.Username)
+		return
+	}
+
+	log.Println("User authenticated:", authData.Username)
+
 	clientMu.Lock()
-	clients[stream] = struct{}{}
+	clients[stream] = &Client{
+		Username: authData.Username,
+		Stream:   stream,
+	}
 	clientMu.Unlock()
 
 	for {
-		buf := make([]byte, 1024)
 		n, err := stream.Read(buf)
 		if err != nil {
 			if err == io.EOF {
 				log.Println("Client disconnected")
+				clientMu.Lock()
+				delete(clients, stream)
+				clientMu.Unlock()
 				return
 			}
 			log.Println(err)
@@ -83,20 +134,49 @@ func handleSession(sess quic.Connection, messageCh chan<- []byte, senderCh chan<
 		message := buf[:n]
 		log.Printf("Received message: %s\n", message)
 
-		messageCh <- message
-		senderCh <- stream
+		handleMessage(authData.Username, message, messageCh, senderCh, stream)
 	}
 }
 
-func broadcastMessages(messageCh <-chan []byte, senderCh <-chan quic.Stream) {
+func handleMessage(username string, message []byte, messageCh chan<- []byte, senderCh chan<- quic.Stream, sender quic.Stream) { //принимаем и ищем кому отправить личные сообщение между клиентами
+	messageStr := string(message)
+	if strings.HasPrefix(messageStr, "/msg ") {
+		parts := strings.SplitN(messageStr, " ", 3)
+		if len(parts) < 3 {
+			return
+		}
+		targetUsername := parts[1]
+		privateMessage := fmt.Sprintf("[Private] %s: %s", username, parts[2])
+		sendPrivateMessage(targetUsername, privateMessage)
+	} else {
+		formattedMessage := fmt.Sprintf("%s: %s", username, messageStr)
+		messageCh <- []byte(formattedMessage)
+		senderCh <- sender
+	}
+}
+
+func sendPrivateMessage(targetUsername, message string) { // отправка приватных сообщений
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	for _, client := range clients {
+		if client.Username == targetUsername {
+			if _, err := client.Stream.Write([]byte(message)); err != nil {
+				log.Println("Error writing private message to client:", err)
+			}
+			return
+		}
+	}
+}
+
+func broadcastMessages(messageCh <-chan []byte, senderCh <-chan quic.Stream) { //рассылаем публичные сообщения всем клиентам на сервере
 	for {
 		select {
 		case message := <-messageCh:
 			sender := <-senderCh
 			clientMu.Lock()
-			for client := range clients {
-				if client != sender {
-					if _, err := client.Write(message); err != nil {
+			for clientStream, client := range clients {
+				if clientStream != sender {
+					if _, err := client.Stream.Write(message); err != nil {
 						log.Println("Error writing message to client:", err)
 					}
 				}
@@ -106,12 +186,7 @@ func broadcastMessages(messageCh <-chan []byte, senderCh <-chan quic.Stream) {
 	}
 }
 
-var (
-	clients  = make(map[quic.Stream]struct{})
-	clientMu sync.Mutex
-)
-
-func generateTLSConfig() *tls.Config {
+func generateTLSConfig() *tls.Config { //установка конфигурации сервера
 	key, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {
 		log.Fatal(err)
